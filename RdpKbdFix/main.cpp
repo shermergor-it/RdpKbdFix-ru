@@ -6,7 +6,7 @@
 #include <format>
 #include <unordered_map>
 
-#define VERSION_STR                 L"1.2-ru"
+#define VERSION_STR                 L"1.2-ru2"
 
 #ifdef _WIN64
 #define MUTEX_NAME                  L"Global\\LowLevelKeyboardHookFix64"
@@ -27,6 +27,9 @@ static const wchar_t* g_pwszProcsToMonitor[] = {
 static HMODULE g_hSelf = nullptr;
 static HOOKPROC g_pVMwareHookFunc = nullptr;
 static HKL g_hklCurrentKeyboard = nullptr;
+static HKL g_hklRussian = nullptr;       // Russian keyboard layout handle (if installed)
+static HKL g_hklEnglish = nullptr;       // English keyboard layout handle (if installed)
+static bool g_bVMInRussianMode = false;  // Tracks assumed layout state inside the VM
 
 static void ExitPrompt(const std::wstring& wstrMsg=L"")
 {
@@ -66,76 +69,116 @@ static bool SetPrivilege(HANDLE hToken,
     return true;
 }
 
-// Try to map a Unicode character to a virtual key code + shift state,
-// searching all installed keyboard layouts. This handles non-ASCII characters
-// (e.g. Cyrillic) that VkKeyScanExA cannot process due to its 1-byte CHAR limit.
+// Returns true if the character is Cyrillic (requires Russian keyboard layout)
+static bool IsCyrillicChar(WCHAR wc)
+{
+    return (wc >= 0x0400 && wc <= 0x04FF);
+}
+
+// Returns true if the character is a Latin letter (requires English keyboard layout)
+static bool IsLatinChar(WCHAR wc)
+{
+    return (wc >= L'A' && wc <= L'Z') || (wc >= L'a' && wc <= L'z');
+}
+
+// Fallback: search all installed keyboard layouts for the given Unicode char.
 static SHORT VkKeyScanExWAllLayouts(WCHAR wc)
 {
-    // Try current layout first (fast path for already-correct layout)
     SHORT result = VkKeyScanExW(wc, g_hklCurrentKeyboard);
     if (result != -1 && (result & 0xFF) != 0xFF)
         return result;
 
-    // Fall back to trying every installed keyboard layout.
-    // This allows Russian input even when the host's active layout is English.
     HKL layouts[64] = {};
     int nLayouts = GetKeyboardLayoutList(_countof(layouts), layouts);
     for (int i = 0; i < nLayouts; i++)
     {
-        if (layouts[i] == g_hklCurrentKeyboard)
-            continue;
+        if (layouts[i] == g_hklCurrentKeyboard) continue;
         result = VkKeyScanExW(wc, layouts[i]);
         if (result != -1 && (result & 0xFF) != 0xFF)
             return result;
     }
-
     return -1;
 }
 
 static void TranslateVKPacket(WPARAM wParam, PKBDLLHOOKSTRUCT pkbdStruct)
 {
     static bool bReportedShiftDown = false;
-    DWORD dwCurrentKeyIdx = 0;
-    INPUT input[2] = { 0 };
+    INPUT inputs[8] = {};
+    int inputCount = 0;
 
-    // Use VkKeyScanExW (Unicode-aware) instead of VkKeyScanExA (1-byte CHAR).
-    // The original VkKeyScanExA cast truncated Cyrillic code points, e.g.
-    // U+0439 ('й') became 0x39 ('9'), causing garbage output.
-    SHORT vkResult = VkKeyScanExWAllLayouts(static_cast<WCHAR>(pkbdStruct->scanCode));
+    WCHAR wc = static_cast<WCHAR>(pkbdStruct->scanCode);
+
+    // Auto-switch VM keyboard layout when the character language changes.
+    // Sends Left Alt + Left Shift to toggle layout inside the VM, so the user
+    // can type both Russian and English from the phone regardless of which
+    // layout the VM currently has active.
+    bool bNeedRussian = IsCyrillicChar(wc);
+    bool bNeedEnglish = IsLatinChar(wc);
+    bool bNeedSwitch  = (bNeedRussian && !g_bVMInRussianMode) ||
+                        (bNeedEnglish &&  g_bVMInRussianMode);
+
+    if (bNeedSwitch)
+    {
+        // Left Alt down
+        inputs[inputCount].type = INPUT_KEYBOARD;
+        inputs[inputCount].ki.wScan = static_cast<WORD>(MapVirtualKeyA(VK_LMENU, MAPVK_VK_TO_VSC));
+        inputs[inputCount++].ki.dwFlags = KEYEVENTF_SCANCODE;
+
+        // Left Shift down  (Alt+Shift = Windows layout switch shortcut)
+        inputs[inputCount].type = INPUT_KEYBOARD;
+        inputs[inputCount].ki.wScan = static_cast<WORD>(MapVirtualKeyA(VK_LSHIFT, MAPVK_VK_TO_VSC));
+        inputs[inputCount++].ki.dwFlags = KEYEVENTF_SCANCODE;
+
+        // Left Shift up
+        inputs[inputCount].type = INPUT_KEYBOARD;
+        inputs[inputCount].ki.wScan = static_cast<WORD>(MapVirtualKeyA(VK_LSHIFT, MAPVK_VK_TO_VSC));
+        inputs[inputCount++].ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
+
+        // Left Alt up
+        inputs[inputCount].type = INPUT_KEYBOARD;
+        inputs[inputCount].ki.wScan = static_cast<WORD>(MapVirtualKeyA(VK_LMENU, MAPVK_VK_TO_VSC));
+        inputs[inputCount++].ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
+
+        g_bVMInRussianMode = bNeedRussian;
+        // Alt+Shift releases any Shift we had previously pressed for uppercase letters
+        bReportedShiftDown = false;
+    }
+
+    // Pick the best HKL for this character (prefer the language-specific one)
+    HKL hklPreferred = bNeedRussian ? (g_hklRussian ? g_hklRussian : g_hklCurrentKeyboard)
+                                    : (g_hklEnglish ? g_hklEnglish : g_hklCurrentKeyboard);
+
+    SHORT vkResult = VkKeyScanExW(wc, hklPreferred);
+    if (vkResult == -1 || (vkResult & 0xFF) == 0xFF)
+        vkResult = VkKeyScanExWAllLayouts(wc);
     if (vkResult == -1)
         return; // Character not found in any installed layout
 
-    // HIBYTE bit 0 indicates Shift is required (works for any layout/language)
+    // HIBYTE bit 0 = Shift required (works for any language, including Cyrillic uppercase)
     bool bNeedsShift = (HIBYTE(vkResult) & 1) != 0;
 
     if (bNeedsShift != bReportedShiftDown)
     {
-        input[0].type = INPUT_KEYBOARD;
-        input[0].ki.wScan = static_cast<WORD>(MapVirtualKeyA(VK_LSHIFT, MAPVK_VK_TO_VSC));
-        input[0].ki.dwFlags = KEYEVENTF_SCANCODE;
-
+        inputs[inputCount].type = INPUT_KEYBOARD;
+        inputs[inputCount].ki.wScan = static_cast<WORD>(MapVirtualKeyA(VK_LSHIFT, MAPVK_VK_TO_VSC));
+        inputs[inputCount].ki.dwFlags = KEYEVENTF_SCANCODE;
         if (bReportedShiftDown)
-        {
-            input[0].ki.dwFlags |= KEYEVENTF_KEYUP;
-        }
-
+            inputs[inputCount].ki.dwFlags |= KEYEVENTF_KEYUP;
+        ++inputCount;
         bReportedShiftDown = bNeedsShift;
-        ++dwCurrentKeyIdx;
     }
 
-    pkbdStruct->vkCode = vkResult & 0xFF;
-    pkbdStruct->scanCode = MapVirtualKeyA(pkbdStruct->vkCode, MAPVK_VK_TO_VSC);
-
-    input[dwCurrentKeyIdx].type = INPUT_KEYBOARD;
-    input[dwCurrentKeyIdx].ki.wScan = static_cast<WORD>(pkbdStruct->scanCode);
-    input[dwCurrentKeyIdx].ki.dwFlags = KEYEVENTF_SCANCODE;
-
+    // Append the character scancode
+    inputs[inputCount].type = INPUT_KEYBOARD;
+    inputs[inputCount].ki.wScan = static_cast<WORD>(MapVirtualKeyA(vkResult & 0xFF, MAPVK_VK_TO_VSC));
+    inputs[inputCount].ki.dwFlags = KEYEVENTF_SCANCODE;
     if (wParam == WM_KEYUP)
-    {
-        input[dwCurrentKeyIdx].ki.dwFlags |= KEYEVENTF_KEYUP;
-    }
+        inputs[inputCount].ki.dwFlags |= KEYEVENTF_KEYUP;
+    ++inputCount;
 
-    SendInput(dwCurrentKeyIdx + 1, input, sizeof(INPUT));
+    // Send everything atomically in one call so the layout switch and character
+    // are delivered to the VM in the correct order without interleaving.
+    SendInput(inputCount, inputs, sizeof(INPUT));
 }
 
 static LRESULT __stdcall HookFunc(int nCode, WPARAM wParam, LPARAM lParam)
@@ -551,6 +594,27 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL,
 
             g_hSelf = hinstDLL;
             g_hklCurrentKeyboard = GetKeyboardLayout(0);
+
+            // Find Russian and English HKLs among installed keyboard layouts
+            {
+                HKL installedLayouts[64] = {};
+                int nInstalled = GetKeyboardLayoutList(_countof(installedLayouts), installedLayouts);
+                for (int i = 0; i < nInstalled; i++)
+                {
+                    LANGID langId = LOWORD(reinterpret_cast<ULONG_PTR>(installedLayouts[i]));
+                    switch (PRIMARYLANGID(langId))
+                    {
+                    case LANG_RUSSIAN: if (!g_hklRussian) g_hklRussian = installedLayouts[i]; break;
+                    case LANG_ENGLISH: if (!g_hklEnglish) g_hklEnglish = installedLayouts[i]; break;
+                    }
+                }
+            }
+
+            // Determine initial VM layout state from the VMware thread's keyboard layout
+            {
+                LANGID langId = LOWORD(reinterpret_cast<ULONG_PTR>(g_hklCurrentKeyboard));
+                g_bVMInRussianMode = (PRIMARYLANGID(langId) == LANG_RUSSIAN);
+            }
 
             if (GetModuleFileNameW(nullptr, wszModFileName, _countof(wszModFileName)))
             {
