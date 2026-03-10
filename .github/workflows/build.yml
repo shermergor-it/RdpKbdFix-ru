@@ -1,0 +1,43 @@
+name: Build RdpKbdFix
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Build x64 Release
+      working-directory: RdpKbdFix
+      run: msbuild RdpKbdFix.sln /m /property:Platform=x64 /property:Configuration=Release
+
+    - name: Build x86 Release
+      working-directory: RdpKbdFix
+      run: msbuild RdpKbdFix.sln /m /property:Platform=x86 /property:Configuration=Release
+
+    - name: Collect DLL artifacts
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Path artifacts -Force
+        Copy-Item "RdpKbdFix/x64/Release/RdpKbdFix64.dll" -Destination "artifacts/" -ErrorAction SilentlyContinue
+        Copy-Item "RdpKbdFix/Release/RdpKbdFix32.dll"     -Destination "artifacts/" -ErrorAction SilentlyContinue
+        # Fallback: search recursively
+        Get-ChildItem -Recurse -Filter "*.dll" | Where-Object { $_.FullName -notlike "*\obj\*" } | Copy-Item -Destination "artifacts/" -ErrorAction SilentlyContinue
+        Get-ChildItem artifacts/
+
+    - name: Upload DLL artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: RdpKbdFix-ru-dlls
+        path: artifacts/
+        if-no-files-found: error
+        retention-days: 90

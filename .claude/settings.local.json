@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(git clone https://github.com/4d61726b/RdpKbdFix.git \"/Users/nikita/Yandex.Disk.localized/Claude Code Working Folder/RdpKbdFix\")",
+      "Bash(git clone https://github.com/4d61726b/RdpKbdFix.git \"/tmp/RdpKbdFix\")",
+      "Bash(brew install gh)",
+      "Bash(/usr/local/bin/brew install gh)",
+      "Bash(/opt/homebrew/bin/brew install gh)",
+      "Bash(/tmp/gh_install/gh_2.87.3_macOS_arm64/bin/gh auth login --web --git-protocol https)",
+      "Bash(git init)",
+      "Bash(git add .)",
+      "Bash(git commit -m \"Add Cyrillic/Russian keyboard support via VkKeyScanExW:*)"
+    ]
+  }
+}
