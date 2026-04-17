@@ -6,7 +6,7 @@
 #include <format>
 #include <unordered_map>
 
-#define VERSION_STR                 L"1.2-ru4"
+#define VERSION_STR                 L"1.2-ru5"
 
 #ifdef _WIN64
 #define MUTEX_NAME                  L"Global\\LowLevelKeyboardHookFix64"
@@ -38,6 +38,7 @@ static bool g_bReportedShiftDown = false; // Whether we've told VMware that Shif
 static const DWORD SHIFT_SETTLE_MS = 150;
 static bool g_bUserAltDown = false;       // Tracks real (non-injected) Alt key state
 static bool g_bUserShiftDown = false;     // Tracks real (non-injected) Shift key state
+static DWORD g_dwShiftDownTime = 0;       // GetTickCount() when real Shift was last pressed
 
 static void ExitPrompt(const std::wstring& wstrMsg=L"")
 {
@@ -256,11 +257,47 @@ static LRESULT __stdcall HookFunc(int nCode, WPARAM wParam, LPARAM lParam)
                 bool bWasDown = g_bUserShiftDown;
                 g_bUserShiftDown = (wParam == WM_KEYDOWN);
 
-                if (wParam == WM_KEYDOWN && !bWasDown && g_bUserAltDown)
+                if (wParam == WM_KEYDOWN && !bWasDown)
                 {
-                    // Real Alt+Shift: VM layout just toggled, update our tracking
-                    g_bVMInRussianMode   = !g_bVMInRussianMode;
-                    g_bReportedShiftDown = false;
+                    g_dwShiftDownTime = GetTickCount(); // record when Shift was first pressed
+
+                    if (g_bUserAltDown)
+                    {
+                        // Real Alt+Shift: VM layout just toggled, update our tracking
+                        g_bVMInRussianMode   = !g_bVMInRussianMode;
+                        g_bReportedShiftDown = false;
+                    }
+                }
+            }
+
+            // ── Settle delay for Mac keyboard uppercase ──────────────────────────
+            // When the user types Shift+letter quickly from a physical keyboard,
+            // the keystrokes reach VRM with near-zero gap and Shift is sometimes
+            // not registered before the letter.  Mirror the same fix we apply to
+            // VK_PACKET: if a non-modifier WM_KEYDOWN arrives while Shift is held
+            // and SHIFT_SETTLE_MS hasn't passed yet, block the original event,
+            // wait out the remainder, then re-inject so the gap propagates through
+            // VMware → VM → RDP → VRM.
+            if (g_bUserShiftDown &&
+                wParam == WM_KEYDOWN &&
+                pkbdStruct->vkCode != VK_LSHIFT  && pkbdStruct->vkCode != VK_RSHIFT &&
+                pkbdStruct->vkCode != VK_LMENU   && pkbdStruct->vkCode != VK_RMENU  &&
+                pkbdStruct->vkCode != VK_LCONTROL && pkbdStruct->vkCode != VK_RCONTROL)
+            {
+                DWORD elapsed = GetTickCount() - g_dwShiftDownTime;
+                if (elapsed < SHIFT_SETTLE_MS)
+                {
+                    Sleep(SHIFT_SETTLE_MS - elapsed);
+
+                    INPUT input = {};
+                    input.type       = INPUT_KEYBOARD;
+                    input.ki.wVk     = static_cast<WORD>(pkbdStruct->vkCode);
+                    input.ki.wScan   = static_cast<WORD>(pkbdStruct->scanCode);
+                    input.ki.dwFlags = 0;
+                    if (pkbdStruct->flags & LLKHF_EXTENDED)
+                        input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+                    SendInput(1, &input, sizeof(INPUT));
+                    return 1; // block the too-early original event
                 }
             }
         }
