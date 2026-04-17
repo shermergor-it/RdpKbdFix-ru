@@ -6,7 +6,7 @@
 #include <format>
 #include <unordered_map>
 
-#define VERSION_STR                 L"1.2-ru3"
+#define VERSION_STR                 L"1.2-ru4"
 
 #ifdef _WIN64
 #define MUTEX_NAME                  L"Global\\LowLevelKeyboardHookFix64"
@@ -31,6 +31,11 @@ static HKL g_hklRussian = nullptr;        // Russian keyboard layout handle (if 
 static HKL g_hklEnglish = nullptr;        // English keyboard layout handle (if installed)
 static bool g_bVMInRussianMode = false;   // Tracks assumed layout state inside the VM
 static bool g_bReportedShiftDown = false; // Whether we've told VMware that Shift is held
+
+// How long to wait after injecting Shift-down before sending the character scancode.
+// This gap propagates through VMware → VM → RDP → VRM, giving VRM enough time to
+// register the Shift-down before the character arrives.
+static const DWORD SHIFT_SETTLE_MS = 150;
 static bool g_bUserAltDown = false;       // Tracks real (non-injected) Alt key state
 static bool g_bUserShiftDown = false;     // Tracks real (non-injected) Shift key state
 
@@ -107,6 +112,7 @@ static void TranslateVKPacket(WPARAM wParam, PKBDLLHOOKSTRUCT pkbdStruct)
 {
     INPUT inputs[8] = {};
     int inputCount = 0;
+    bool bShiftJustPressed = false; // true when we're adding a fresh Shift-down this call
 
     WCHAR wc = static_cast<WCHAR>(pkbdStruct->scanCode);
 
@@ -168,6 +174,19 @@ static void TranslateVKPacket(WPARAM wParam, PKBDLLHOOKSTRUCT pkbdStruct)
             inputs[inputCount].ki.dwFlags |= KEYEVENTF_KEYUP;
         ++inputCount;
         g_bReportedShiftDown = bNeedsShift;
+        if (bNeedsShift)
+            bShiftJustPressed = true;
+    }
+
+    // If Shift was just pressed, flush it now and wait for it to settle before
+    // sending the character.  The gap propagates through VMware → VM → RDP → VRM,
+    // so VRM has time to register Shift-down before the character arrives.
+    // Only on WM_KEYDOWN — no delay needed for key-up events.
+    if (bShiftJustPressed && wParam == WM_KEYDOWN)
+    {
+        SendInput(inputCount, inputs, sizeof(INPUT));
+        Sleep(SHIFT_SETTLE_MS);
+        inputCount = 0; // start fresh for the character below
     }
 
     // Append the character scancode
@@ -178,8 +197,6 @@ static void TranslateVKPacket(WPARAM wParam, PKBDLLHOOKSTRUCT pkbdStruct)
         inputs[inputCount].ki.dwFlags |= KEYEVENTF_KEYUP;
     ++inputCount;
 
-    // Send everything atomically in one call so the layout switch and character
-    // are delivered to the VM in the correct order without interleaving.
     SendInput(inputCount, inputs, sizeof(INPUT));
 }
 
