@@ -6,7 +6,7 @@
 #include <format>
 #include <unordered_map>
 
-#define VERSION_STR                 L"1.2-ru2"
+#define VERSION_STR                 L"1.2-ru3"
 
 #ifdef _WIN64
 #define MUTEX_NAME                  L"Global\\LowLevelKeyboardHookFix64"
@@ -27,9 +27,12 @@ static const wchar_t* g_pwszProcsToMonitor[] = {
 static HMODULE g_hSelf = nullptr;
 static HOOKPROC g_pVMwareHookFunc = nullptr;
 static HKL g_hklCurrentKeyboard = nullptr;
-static HKL g_hklRussian = nullptr;       // Russian keyboard layout handle (if installed)
-static HKL g_hklEnglish = nullptr;       // English keyboard layout handle (if installed)
-static bool g_bVMInRussianMode = false;  // Tracks assumed layout state inside the VM
+static HKL g_hklRussian = nullptr;        // Russian keyboard layout handle (if installed)
+static HKL g_hklEnglish = nullptr;        // English keyboard layout handle (if installed)
+static bool g_bVMInRussianMode = false;   // Tracks assumed layout state inside the VM
+static bool g_bReportedShiftDown = false; // Whether we've told VMware that Shift is held
+static bool g_bUserAltDown = false;       // Tracks real (non-injected) Alt key state
+static bool g_bUserShiftDown = false;     // Tracks real (non-injected) Shift key state
 
 static void ExitPrompt(const std::wstring& wstrMsg=L"")
 {
@@ -102,7 +105,6 @@ static SHORT VkKeyScanExWAllLayouts(WCHAR wc)
 
 static void TranslateVKPacket(WPARAM wParam, PKBDLLHOOKSTRUCT pkbdStruct)
 {
-    static bool bReportedShiftDown = false;
     INPUT inputs[8] = {};
     int inputCount = 0;
 
@@ -141,7 +143,7 @@ static void TranslateVKPacket(WPARAM wParam, PKBDLLHOOKSTRUCT pkbdStruct)
 
         g_bVMInRussianMode = bNeedRussian;
         // Alt+Shift releases any Shift we had previously pressed for uppercase letters
-        bReportedShiftDown = false;
+        g_bReportedShiftDown = false;
     }
 
     // Pick the best HKL for this character (prefer the language-specific one)
@@ -157,15 +159,15 @@ static void TranslateVKPacket(WPARAM wParam, PKBDLLHOOKSTRUCT pkbdStruct)
     // HIBYTE bit 0 = Shift required (works for any language, including Cyrillic uppercase)
     bool bNeedsShift = (HIBYTE(vkResult) & 1) != 0;
 
-    if (bNeedsShift != bReportedShiftDown)
+    if (bNeedsShift != g_bReportedShiftDown)
     {
         inputs[inputCount].type = INPUT_KEYBOARD;
         inputs[inputCount].ki.wScan = static_cast<WORD>(MapVirtualKeyA(VK_LSHIFT, MAPVK_VK_TO_VSC));
         inputs[inputCount].ki.dwFlags = KEYEVENTF_SCANCODE;
-        if (bReportedShiftDown)
+        if (g_bReportedShiftDown)
             inputs[inputCount].ki.dwFlags |= KEYEVENTF_KEYUP;
         ++inputCount;
-        bReportedShiftDown = bNeedsShift;
+        g_bReportedShiftDown = bNeedsShift;
     }
 
     // Append the character scancode
@@ -185,12 +187,66 @@ static LRESULT __stdcall HookFunc(int nCode, WPARAM wParam, LPARAM lParam)
 {
     PKBDLLHOOKSTRUCT pkbdStruct = reinterpret_cast<PKBDLLHOOKSTRUCT>(lParam);
 
-    if (nCode >= 0 &&
-        (wParam == WM_KEYDOWN || wParam == WM_KEYUP) &&
-        pkbdStruct->vkCode == VK_PACKET)
+    if (nCode >= 0 && (wParam == WM_KEYDOWN || wParam == WM_KEYUP))
     {
-        TranslateVKPacket(wParam, pkbdStruct);
-        return 1;
+        bool bIsInjected = (pkbdStruct->flags & LLKHF_INJECTED) != 0;
+
+        if (pkbdStruct->vkCode == VK_PACKET)
+        {
+            TranslateVKPacket(wParam, pkbdStruct);
+            return 1;
+        }
+
+        // Only process real (non-injected) keystrokes below.
+        // Injected events are our own SendInput calls — skip to avoid double-toggling.
+        if (!bIsInjected)
+        {
+            // ── Scroll Lock: manual layout sync ─────────────────────────────────
+            // Press Scroll Lock to toggle RdpKbdFix's idea of the VM's current layout.
+            // Use this whenever the DLL gets out of sync (e.g. after connecting,
+            // or after manually switching layout via the on-screen function keys).
+            // The key is blocked from reaching VMware.
+            // Audio feedback: one beep = now tracking English, two beeps = Russian.
+            if (pkbdStruct->vkCode == VK_SCROLL && wParam == WM_KEYDOWN)
+            {
+                g_bVMInRussianMode  = !g_bVMInRussianMode;
+                g_bReportedShiftDown = false;
+                if (g_bVMInRussianMode)
+                {
+                    MessageBeep(MB_ICONINFORMATION); // one distinct beep = Russian
+                    Sleep(180);
+                    MessageBeep(MB_ICONINFORMATION); // two beeps
+                }
+                else
+                {
+                    MessageBeep(MB_OK); // one short beep = English
+                }
+                return 1; // Block key — do not pass to VMware
+            }
+
+            // ── Track real Alt state ─────────────────────────────────────────────
+            if (pkbdStruct->vkCode == VK_LMENU || pkbdStruct->vkCode == VK_RMENU)
+                g_bUserAltDown = (wParam == WM_KEYDOWN);
+
+            // ── Track real Shift state + detect manual Alt+Shift ─────────────────
+            // When the user manually presses Alt+Shift (e.g. via function row on iPhone
+            // or from a physical keyboard), the VM's layout switches but our
+            // g_bVMInRussianMode variable isn't updated — causing the next VK_PACKET
+            // to trigger a spurious layout switch that corrupts Shift state.
+            // Fix: detect real Alt+Shift and mirror the toggle in our tracking variable.
+            if (pkbdStruct->vkCode == VK_LSHIFT || pkbdStruct->vkCode == VK_RSHIFT)
+            {
+                bool bWasDown = g_bUserShiftDown;
+                g_bUserShiftDown = (wParam == WM_KEYDOWN);
+
+                if (wParam == WM_KEYDOWN && !bWasDown && g_bUserAltDown)
+                {
+                    // Real Alt+Shift: VM layout just toggled, update our tracking
+                    g_bVMInRussianMode   = !g_bVMInRussianMode;
+                    g_bReportedShiftDown = false;
+                }
+            }
+        }
     }
 
     return g_pVMwareHookFunc(nCode, wParam, lParam);
